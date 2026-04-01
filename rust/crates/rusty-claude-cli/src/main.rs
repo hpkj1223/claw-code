@@ -11,8 +11,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, ImageSource,
-    InputContentBlock, InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 
@@ -41,7 +41,6 @@ const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 
 type AllowedToolSet = BTreeSet<String>;
-const IMAGE_REF_PREFIX: &str = "@";
 
 fn main() {
     if let Err(error) = run() {
@@ -71,7 +70,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             allowed_tools,
             permission_mode,
-        } => LiveCli::new(model, false, allowed_tools, permission_mode)?
+            color,
+        } => LiveCli::new(model, false, allowed_tools, permission_mode, color)?
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
@@ -79,7 +79,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
-        } => run_repl(model, allowed_tools, permission_mode)?,
+            color,
+        } => run_repl(model, allowed_tools, permission_mode, color)?,
         CliAction::Help => print_help(),
     }
     Ok(())
@@ -104,6 +105,7 @@ enum CliAction {
         output_format: CliOutputFormat,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        color: bool,
     },
     Login,
     Logout,
@@ -111,6 +113,7 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        color: bool,
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help,
@@ -141,6 +144,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut permission_mode = default_permission_mode();
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
+    let mut color = true;
     let mut rest = Vec::new();
     let mut index = 0;
 
@@ -148,6 +152,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         match args[index].as_str() {
             "--version" | "-V" => {
                 wants_version = true;
+                index += 1;
+            }
+            "--no-color" => {
+                color = false;
                 index += 1;
             }
             "--model" => {
@@ -216,6 +224,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            color,
         });
     }
     if matches!(rest.first().map(String::as_str), Some("--help" | "-h")) {
@@ -242,6 +251,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 output_format,
                 allowed_tools,
                 permission_mode,
+                color,
             })
         }
         other if !other.starts_with('/') => Ok(CliAction::Prompt {
@@ -250,6 +260,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             output_format,
             allowed_tools,
             permission_mode,
+            color,
         }),
         other => Err(format!("unknown subcommand: {other}")),
     }
@@ -892,8 +903,9 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    color: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, color)?;
     let mut editor = input::LineEditor::new("› ", slash_command_completion_candidates());
     println!("{}", cli.startup_banner());
 
@@ -946,9 +958,11 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    color: bool,
     system_prompt: Vec<String>,
     runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
     session: SessionHandle,
+    renderer: TerminalRenderer,
 }
 
 impl LiveCli {
@@ -957,6 +971,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        color: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt()?;
         let session = create_managed_session_handle()?;
@@ -967,14 +982,17 @@ impl LiveCli {
             enable_tools,
             allowed_tools.clone(),
             permission_mode,
+            color,
         )?;
         let cli = Self {
             model,
             allowed_tools,
             permission_mode,
+            color,
             system_prompt,
             runtime,
             session,
+            renderer: TerminalRenderer::with_color(color),
         };
         cli.persist_session()?;
         Ok(cli)
@@ -998,26 +1016,33 @@ impl LiveCli {
         let mut stdout = io::stdout();
         spinner.tick(
             "Waiting for Claude",
-            TerminalRenderer::new().color_theme(),
+            self.renderer.color_theme(),
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
         let result = self.runtime.run_turn(input, Some(&mut permission_prompter));
         match result {
-            Ok(_) => {
+            Ok(summary) => {
                 spinner.finish(
                     "Claude response complete",
-                    TerminalRenderer::new().color_theme(),
+                    self.renderer.color_theme(),
                     &mut stdout,
                 )?;
                 println!();
+                println!(
+                    "{}",
+                    self.renderer.token_usage_summary(
+                        u64::from(summary.usage.input_tokens),
+                        u64::from(summary.usage.output_tokens)
+                    )
+                );
                 self.persist_session()?;
                 Ok(())
             }
             Err(error) => {
                 spinner.fail(
                     "Claude request failed",
-                    TerminalRenderer::new().color_theme(),
+                    self.renderer.color_theme(),
                     &mut stdout,
                 )?;
                 Err(Box::new(error))
@@ -1043,7 +1068,9 @@ impl LiveCli {
             max_tokens: DEFAULT_MAX_TOKENS,
             messages: vec![InputMessage {
                 role: "user".to_string(),
-                content: prompt_to_content_blocks(input, &env::current_dir()?)?,
+                content: vec![InputContentBlock::Text {
+                    text: input.to_string(),
+                }],
             }],
             system: (!self.system_prompt.is_empty()).then(|| self.system_prompt.join("\n\n")),
             tools: None,
@@ -1196,6 +1223,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.color,
         )?;
         self.model.clone_from(&model);
         println!(
@@ -1238,6 +1266,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.color,
         )?;
         println!(
             "{}",
@@ -1262,6 +1291,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.color,
         )?;
         println!(
             "Session cleared\n  Mode             fresh session\n  Preserved model  {}\n  Permission mode  {}\n  Session          {}",
@@ -1296,6 +1326,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.color,
         )?;
         self.session = handle;
         println!(
@@ -1372,6 +1403,7 @@ impl LiveCli {
                     true,
                     self.allowed_tools.clone(),
                     self.permission_mode,
+                    self.color,
                 )?;
                 self.session = handle;
                 println!(
@@ -1401,6 +1433,7 @@ impl LiveCli {
             true,
             self.allowed_tools.clone(),
             self.permission_mode,
+            self.color,
         )?;
         self.persist_session()?;
         println!("{}", format_compact_report(removed, kept, skipped));
@@ -1533,7 +1566,6 @@ fn status_context(
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let discovered_config_files = discovered_config_files.max(runtime_config.loaded_entries().len());
     let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
@@ -1542,8 +1574,7 @@ fn status_context(
         session_path: session_path.map(Path::to_path_buf),
         loaded_config_files: runtime_config.loaded_entries().len(),
         discovered_config_files,
-        memory_file_count: project_context.instruction_files.len()
-            + project_context.memory_files.len(),
+        memory_file_count: project_context.instruction_files.len(),
         project_root,
         git_branch,
     })
@@ -1688,56 +1719,37 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
     let mut lines = vec![format!(
         "Memory
   Working directory {}
-  Instruction files {}
-  Project memory files {}",
+  Instruction files {}",
         cwd.display(),
-        project_context.instruction_files.len(),
-        project_context.memory_files.len()
+        project_context.instruction_files.len()
     )];
-    append_memory_section(
-        &mut lines,
-        "Instruction files",
-        &project_context.instruction_files,
-        "No CLAUDE instruction files discovered in the current directory ancestry.",
-    );
-    append_memory_section(
-        &mut lines,
-        "Project memory files",
-        &project_context.memory_files,
-        "No persisted project memory files discovered in .claude/memory.",
-    );
+    if project_context.instruction_files.is_empty() {
+        lines.push("Discovered files".to_string());
+        lines.push(
+            "  No CLAUDE instruction files discovered in the current directory ancestry."
+                .to_string(),
+        );
+    } else {
+        lines.push("Discovered files".to_string());
+        for (index, file) in project_context.instruction_files.iter().enumerate() {
+            let preview = file.content.lines().next().unwrap_or("").trim();
+            let preview = if preview.is_empty() {
+                "<empty>"
+            } else {
+                preview
+            };
+            lines.push(format!("  {}. {}", index + 1, file.path.display(),));
+            lines.push(format!(
+                "     lines={} preview={}",
+                file.content.lines().count(),
+                preview
+            ));
+        }
+    }
     Ok(lines.join(
         "
 ",
     ))
-}
-
-fn append_memory_section(
-    lines: &mut Vec<String>,
-    title: &str,
-    files: &[runtime::ContextFile],
-    empty_message: &str,
-) {
-    lines.push(title.to_string());
-    if files.is_empty() {
-        lines.push(format!("  {empty_message}"));
-        return;
-    }
-
-    for (index, file) in files.iter().enumerate() {
-        let preview = file.content.lines().next().unwrap_or("").trim();
-        let preview = if preview.is_empty() {
-            "<empty>"
-        } else {
-            preview
-        };
-        lines.push(format!("  {}. {}", index + 1, file.path.display()));
-        lines.push(format!(
-            "     lines={} preview={}",
-            file.content.lines().count(),
-            preview
-        ));
-    }
 }
 
 fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
@@ -1944,12 +1956,13 @@ fn build_runtime(
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    color: bool,
 ) -> Result<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>, Box<dyn std::error::Error>>
 {
     Ok(ConversationRuntime::new(
         session,
-        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone())?,
-        CliToolExecutor::new(allowed_tools),
+        AnthropicRuntimeClient::new(model, enable_tools, allowed_tools.clone(), color)?,
+        CliToolExecutor::new(allowed_tools, color),
         permission_policy(permission_mode),
         system_prompt,
     ))
@@ -2007,6 +2020,7 @@ struct AnthropicRuntimeClient {
     model: String,
     enable_tools: bool,
     allowed_tools: Option<AllowedToolSet>,
+    color: bool,
 }
 
 impl AnthropicRuntimeClient {
@@ -2014,6 +2028,7 @@ impl AnthropicRuntimeClient {
         model: String,
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
+        color: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
@@ -2021,6 +2036,7 @@ impl AnthropicRuntimeClient {
             model,
             enable_tools,
             allowed_tools,
+            color,
         })
     }
 }
@@ -2041,7 +2057,7 @@ impl ApiClient for AnthropicRuntimeClient {
         let message_request = MessageRequest {
             model: self.model.clone(),
             max_tokens: DEFAULT_MAX_TOKENS,
-            messages: convert_messages(&request.messages)?,
+            messages: convert_messages(&request.messages),
             system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
             tools: self.enable_tools.then(|| {
                 filter_tool_specs(self.allowed_tools.as_ref())
@@ -2057,6 +2073,7 @@ impl ApiClient for AnthropicRuntimeClient {
             stream: true,
         };
 
+        let renderer = TerminalRenderer::with_color(self.color);
         self.runtime.block_on(async {
             let mut stream = self
                 .client
@@ -2076,11 +2093,18 @@ impl ApiClient for AnthropicRuntimeClient {
                 match event {
                     ApiStreamEvent::MessageStart(start) => {
                         for block in start.message.content {
-                            push_output_block(block, &mut stdout, &mut events, &mut pending_tool)?;
+                            push_output_block(
+                                &TerminalRenderer::with_color(true),
+                                block,
+                                &mut stdout,
+                                &mut events,
+                                &mut pending_tool,
+                            )?;
                         }
                     }
                     ApiStreamEvent::ContentBlockStart(start) => {
                         push_output_block(
+                            &renderer,
                             start.content_block,
                             &mut stdout,
                             &mut events,
@@ -2146,7 +2170,7 @@ impl ApiClient for AnthropicRuntimeClient {
                 })
                 .await
                 .map_err(|error| RuntimeError::new(error.to_string()))?;
-            response_to_events(response, &mut stdout)
+            response_to_events(&renderer, response, &mut stdout)
         })
     }
 }
@@ -2158,19 +2182,29 @@ fn slash_command_completion_candidates() -> Vec<String> {
         .collect()
 }
 
-fn format_tool_call_start(name: &str, input: &str) -> String {
+fn format_tool_call_start(renderer: &TerminalRenderer, name: &str, input: &str) -> String {
     format!(
-        "Tool call
-  Name             {name}
-  Input            {}",
+        "{} {} {} {}",
+        renderer.warning("Tool call:"),
+        renderer.info(name),
+        renderer.warning("args="),
         summarize_tool_payload(input)
     )
 }
 
-fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
-    let status = if is_error { "error" } else { "ok" };
+fn format_tool_result(
+    renderer: &TerminalRenderer,
+    name: &str,
+    output: &str,
+    is_error: bool,
+) -> String {
+    let status = if is_error {
+        renderer.error("error")
+    } else {
+        renderer.success("ok")
+    };
     format!(
-        "### Tool `{name}`
+        "### {} {}
 
 - Status: {status}
 - Output:
@@ -2179,6 +2213,8 @@ fn format_tool_result(name: &str, output: &str, is_error: bool) -> String {
 {}
 ```
 ",
+        renderer.warning("Tool"),
+        renderer.info(format!("`{name}`")),
         prettify_tool_payload(output)
     )
 }
@@ -2209,6 +2245,7 @@ fn truncate_for_summary(value: &str, limit: usize) -> String {
 }
 
 fn push_output_block(
+    renderer: &TerminalRenderer,
     block: OutputContentBlock,
     out: &mut impl Write,
     events: &mut Vec<AssistantEvent>,
@@ -2228,7 +2265,7 @@ fn push_output_block(
                 out,
                 "
 {}",
-                format_tool_call_start(&name, &input.to_string())
+                format_tool_call_start(renderer, &name, &input.to_string())
             )
             .and_then(|()| out.flush())
             .map_err(|error| RuntimeError::new(error.to_string()))?;
@@ -2239,6 +2276,7 @@ fn push_output_block(
 }
 
 fn response_to_events(
+    renderer: &TerminalRenderer,
     response: MessageResponse,
     out: &mut impl Write,
 ) -> Result<Vec<AssistantEvent>, RuntimeError> {
@@ -2246,7 +2284,7 @@ fn response_to_events(
     let mut pending_tool = None;
 
     for block in response.content {
-        push_output_block(block, out, &mut events, &mut pending_tool)?;
+        push_output_block(renderer, block, out, &mut events, &mut pending_tool)?;
         if let Some((id, name, input)) = pending_tool.take() {
             events.push(AssistantEvent::ToolUse { id, name, input });
         }
@@ -2268,9 +2306,9 @@ struct CliToolExecutor {
 }
 
 impl CliToolExecutor {
-    fn new(allowed_tools: Option<AllowedToolSet>) -> Self {
+    fn new(allowed_tools: Option<AllowedToolSet>, color: bool) -> Self {
         Self {
-            renderer: TerminalRenderer::new(),
+            renderer: TerminalRenderer::with_color(color),
             allowed_tools,
         }
     }
@@ -2291,14 +2329,14 @@ impl ToolExecutor for CliToolExecutor {
             .map_err(|error| ToolError::new(format!("invalid tool input JSON: {error}")))?;
         match execute_tool(tool_name, &value) {
             Ok(output) => {
-                let markdown = format_tool_result(tool_name, &output, false);
+                let markdown = format_tool_result(&self.renderer, tool_name, &output, false);
                 self.renderer
                     .stream_markdown(&markdown, &mut io::stdout())
                     .map_err(|error| ToolError::new(error.to_string()))?;
                 Ok(output)
             }
             Err(error) => {
-                let markdown = format_tool_result(tool_name, &error, true);
+                let markdown = format_tool_result(&self.renderer, tool_name, &error, true);
                 self.renderer
                     .stream_markdown(&markdown, &mut io::stdout())
                     .map_err(|stream_error| ToolError::new(stream_error.to_string()))?;
@@ -2320,10 +2358,7 @@ fn tool_permission_specs() -> Vec<ToolSpec> {
     mvp_tool_specs()
 }
 
-fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage>, RuntimeError> {
-    let cwd = env::current_dir().map_err(|error| {
-        RuntimeError::new(format!("failed to resolve current directory: {error}"))
-    })?;
+fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
     messages
         .iter()
         .filter_map(|message| {
@@ -2334,222 +2369,34 @@ fn convert_messages(messages: &[ConversationMessage]) -> Result<Vec<InputMessage
             let content = message
                 .blocks
                 .iter()
-                .try_fold(Vec::new(), |mut acc, block| {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            if message.role == MessageRole::User {
-                                acc.extend(
-                                    prompt_to_content_blocks(text, &cwd)
-                                        .map_err(RuntimeError::new)?,
-                                );
-                            } else {
-                                acc.push(InputContentBlock::Text { text: text.clone() });
-                            }
-                        }
-                        ContentBlock::ToolUse { id, name, input } => {
-                            acc.push(InputContentBlock::ToolUse {
-                                id: id.clone(),
-                                name: name.clone(),
-                                input: serde_json::from_str(input)
-                                    .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
-                            });
-                        }
-                        ContentBlock::ToolResult {
-                            tool_use_id,
-                            output,
-                            is_error,
-                            ..
-                        } => acc.push(InputContentBlock::ToolResult {
-                            tool_use_id: tool_use_id.clone(),
-                            content: vec![ToolResultContentBlock::Text {
-                                text: output.clone(),
-                            }],
-                            is_error: *is_error,
-                        }),
-                    }
-                    Ok::<_, RuntimeError>(acc)
-                });
-            match content {
-                Ok(content) if !content.is_empty() => Some(Ok(InputMessage {
-                    role: role.to_string(),
-                    content,
-                })),
-                Ok(_) => None,
-                Err(error) => Some(Err(error)),
-            }
+                .map(|block| match block {
+                    ContentBlock::Text { text } => InputContentBlock::Text { text: text.clone() },
+                    ContentBlock::ToolUse { id, name, input } => InputContentBlock::ToolUse {
+                        id: id.clone(),
+                        name: name.clone(),
+                        input: serde_json::from_str(input)
+                            .unwrap_or_else(|_| serde_json::json!({ "raw": input })),
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id,
+                        output,
+                        is_error,
+                        ..
+                    } => InputContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: vec![ToolResultContentBlock::Text {
+                            text: output.clone(),
+                        }],
+                        is_error: *is_error,
+                    },
+                })
+                .collect::<Vec<_>>();
+            (!content.is_empty()).then(|| InputMessage {
+                role: role.to_string(),
+                content,
+            })
         })
         .collect()
-}
-
-fn prompt_to_content_blocks(input: &str, cwd: &Path) -> Result<Vec<InputContentBlock>, String> {
-    let mut blocks = Vec::new();
-    let mut text_buffer = String::new();
-    let mut chars = input.char_indices().peekable();
-
-    while let Some((index, ch)) = chars.next() {
-        if ch == '!' && input[index..].starts_with("![") {
-            if let Some((alt_end, path_start, path_end)) = parse_markdown_image_ref(input, index) {
-                let _ = alt_end;
-                flush_text_block(&mut blocks, &mut text_buffer);
-                let path = &input[path_start..path_end];
-                blocks.push(load_image_block(path, cwd)?);
-                while let Some((next_index, _)) = chars.peek() {
-                    if *next_index < path_end + 1 {
-                        let _ = chars.next();
-                    } else {
-                        break;
-                    }
-                }
-                continue;
-            }
-        }
-
-        if ch == '@' && is_ref_boundary(input[..index].chars().next_back()) {
-            let path_end = find_path_end(input, index + 1);
-            if path_end > index + 1 {
-                let candidate = &input[index + 1..path_end];
-                if looks_like_image_ref(candidate, cwd) {
-                    flush_text_block(&mut blocks, &mut text_buffer);
-                    blocks.push(load_image_block(candidate, cwd)?);
-                    while let Some((next_index, _)) = chars.peek() {
-                        if *next_index < path_end {
-                            let _ = chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-            }
-        }
-
-        text_buffer.push(ch);
-    }
-
-    flush_text_block(&mut blocks, &mut text_buffer);
-    if blocks.is_empty() {
-        blocks.push(InputContentBlock::Text {
-            text: input.to_string(),
-        });
-    }
-    Ok(blocks)
-}
-
-fn parse_markdown_image_ref(input: &str, start: usize) -> Option<(usize, usize, usize)> {
-    let after_bang = input.get(start + 2..)?;
-    let alt_end_offset = after_bang.find("](")?;
-    let path_start = start + 2 + alt_end_offset + 2;
-    let remainder = input.get(path_start..)?;
-    let path_end_offset = remainder.find(')')?;
-    let path_end = path_start + path_end_offset;
-    Some((start + 2 + alt_end_offset, path_start, path_end))
-}
-
-fn is_ref_boundary(ch: Option<char>) -> bool {
-    ch.is_none_or(char::is_whitespace)
-}
-
-fn find_path_end(input: &str, start: usize) -> usize {
-    input[start..]
-        .char_indices()
-        .find_map(|(offset, ch)| (ch.is_whitespace()).then_some(start + offset))
-        .unwrap_or(input.len())
-}
-
-fn looks_like_image_ref(candidate: &str, cwd: &Path) -> bool {
-    let resolved = resolve_prompt_path(candidate, cwd);
-    media_type_for_path(Path::new(candidate)).is_some()
-        || resolved.is_file()
-        || candidate.contains(std::path::MAIN_SEPARATOR)
-        || candidate.starts_with("./")
-        || candidate.starts_with("../")
-}
-
-fn flush_text_block(blocks: &mut Vec<InputContentBlock>, text_buffer: &mut String) {
-    if text_buffer.is_empty() {
-        return;
-    }
-    blocks.push(InputContentBlock::Text {
-        text: std::mem::take(text_buffer),
-    });
-}
-
-fn load_image_block(path_ref: &str, cwd: &Path) -> Result<InputContentBlock, String> {
-    let resolved = resolve_prompt_path(path_ref, cwd);
-    let media_type = media_type_for_path(&resolved).ok_or_else(|| {
-        format!(
-            "unsupported image format for reference {IMAGE_REF_PREFIX}{path_ref}; supported: png, jpg, jpeg, gif, webp"
-        )
-    })?;
-    let bytes = fs::read(&resolved).map_err(|error| {
-        format!(
-            "failed to read image reference {}: {error}",
-            resolved.display()
-        )
-    })?;
-    Ok(InputContentBlock::Image {
-        source: ImageSource {
-            kind: "base64".to_string(),
-            media_type: media_type.to_string(),
-            data: encode_base64(&bytes),
-        },
-    })
-}
-
-fn resolve_prompt_path(path_ref: &str, cwd: &Path) -> PathBuf {
-    let path = Path::new(path_ref);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
-    }
-}
-
-fn media_type_for_path(path: &Path) -> Option<&'static str> {
-    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
-    match extension.as_str() {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        _ => None,
-    }
-}
-
-fn encode_base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut output = String::new();
-    let mut index = 0;
-    while index + 3 <= bytes.len() {
-        let block = (u32::from(bytes[index]) << 16)
-            | (u32::from(bytes[index + 1]) << 8)
-            | u32::from(bytes[index + 2]);
-        output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
-        output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
-        output.push(TABLE[((block >> 6) & 0x3F) as usize] as char);
-        output.push(TABLE[(block & 0x3F) as usize] as char);
-        index += 3;
-    }
-
-    match bytes.len().saturating_sub(index) {
-        1 => {
-            let block = u32::from(bytes[index]) << 16;
-            output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
-            output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
-            output.push('=');
-            output.push('=');
-        }
-        2 => {
-            let block = (u32::from(bytes[index]) << 16) | (u32::from(bytes[index + 1]) << 8);
-            output.push(TABLE[((block >> 18) & 0x3F) as usize] as char);
-            output.push(TABLE[((block >> 12) & 0x3F) as usize] as char);
-            output.push(TABLE[((block >> 6) & 0x3F) as usize] as char);
-            output.push('=');
-        }
-        _ => {}
-    }
-
-    output
 }
 
 fn print_help() {
@@ -2575,6 +2422,7 @@ fn print_help() {
     println!("  --output-format FORMAT     Non-interactive output format: text or json");
     println!("  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access");
     println!("  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)");
+    println!("  --no-color                 Disable ANSI color output");
     println!("  --version, -V              Print version and build information locally");
     println!();
     println!("Interactive slash commands:");
@@ -2598,6 +2446,77 @@ fn print_help() {
 }
 
 #[cfg(test)]
+fn print_help_text_for_test() -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(
+        output,
+        "rusty-claude-cli v{VERSION}
+"
+    );
+    let _ = writeln!(output, "Usage:");
+    let _ = writeln!(
+        output,
+        "  rusty-claude-cli [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+    );
+    let _ = writeln!(output, "      Start the interactive REPL");
+    let _ = writeln!(
+        output,
+        "  rusty-claude-cli [--model MODEL] [--output-format text|json] prompt TEXT"
+    );
+    let _ = writeln!(output, "      Send one prompt and exit");
+    let _ = writeln!(
+        output,
+        "  rusty-claude-cli [--model MODEL] [--output-format text|json] TEXT"
+    );
+    let _ = writeln!(output, "      Shorthand non-interactive prompt mode");
+    let _ = writeln!(
+        output,
+        "  rusty-claude-cli --resume SESSION.json [/status] [/compact] [...]"
+    );
+    let _ = writeln!(
+        output,
+        "      Inspect or maintain a saved session without entering the REPL"
+    );
+    let _ = writeln!(output, "  rusty-claude-cli dump-manifests");
+    let _ = writeln!(output, "  rusty-claude-cli bootstrap-plan");
+    let _ = writeln!(
+        output,
+        "  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
+    );
+    let _ = writeln!(output, "  rusty-claude-cli login");
+    let _ = writeln!(
+        output,
+        "  rusty-claude-cli logout
+"
+    );
+    let _ = writeln!(output, "Flags:");
+    let _ = writeln!(
+        output,
+        "  --model MODEL              Override the active model"
+    );
+    let _ = writeln!(
+        output,
+        "  --output-format FORMAT     Non-interactive output format: text or json"
+    );
+    let _ = writeln!(
+        output,
+        "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
+    );
+    let _ = writeln!(output, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)");
+    let _ = writeln!(
+        output,
+        "  --no-color                 Disable ANSI color output"
+    );
+    let _ = writeln!(
+        output,
+        "  --version, -V              Print version and build information locally"
+    );
+    output
+}
+
+#[cfg(test)]
 mod tests {
     use super::{
         filter_tool_specs, format_compact_report, format_cost_report, format_init_report,
@@ -2608,10 +2527,9 @@ mod tests {
         render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
         CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
-    use api::InputContentBlock;
+    use crate::{print_help_text_for_test, render::TerminalRenderer};
     use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use std::path::{Path, PathBuf};
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
     fn defaults_to_repl_when_no_args() {
@@ -2621,6 +2539,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                color: true,
             }
         );
     }
@@ -2640,6 +2559,7 @@ mod tests {
                 output_format: CliOutputFormat::Text,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                color: true,
             }
         );
     }
@@ -2661,6 +2581,27 @@ mod tests {
                 output_format: CliOutputFormat::Json,
                 allowed_tools: None,
                 permission_mode: PermissionMode::WorkspaceWrite,
+                color: true,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_no_color_flag() {
+        let args = vec![
+            "--no-color".to_string(),
+            "prompt".to_string(),
+            "hello".to_string(),
+        ];
+        assert_eq!(
+            parse_args(&args).expect("args should parse"),
+            CliAction::Prompt {
+                prompt: "hello".to_string(),
+                model: DEFAULT_MODEL.to_string(),
+                output_format: CliOutputFormat::Text,
+                allowed_tools: None,
+                permission_mode: PermissionMode::WorkspaceWrite,
+                color: false,
             }
         );
     }
@@ -2686,6 +2627,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                color: true,
             }
         );
     }
@@ -2708,6 +2650,7 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::WorkspaceWrite,
+                color: true,
             }
         );
     }
@@ -2985,7 +2928,7 @@ mod tests {
         assert!(report.contains("Memory"));
         assert!(report.contains("Working directory"));
         assert!(report.contains("Instruction files"));
-        assert!(report.contains("Project memory files"));
+        assert!(report.contains("Discovered files"));
     }
 
     #[test]
@@ -3094,126 +3037,31 @@ mod tests {
             },
         ];
 
-        let converted = super::convert_messages(&messages).expect("messages should convert");
+        let converted = super::convert_messages(&messages);
         assert_eq!(converted.len(), 3);
         assert_eq!(converted[1].role, "assistant");
         assert_eq!(converted[2].role, "user");
-    }
-
-    #[test]
-    fn prompt_to_content_blocks_keeps_text_only_prompt() {
-        let blocks = super::prompt_to_content_blocks("hello world", Path::new("."))
-            .expect("text prompt should parse");
-        assert_eq!(
-            blocks,
-            vec![InputContentBlock::Text {
-                text: "hello world".to_string()
-            }]
-        );
-    }
-
-    #[test]
-    fn prompt_to_content_blocks_embeds_at_image_refs() {
-        let temp = temp_fixture_dir("at-image-ref");
-        let image_path = temp.join("sample.png");
-        std::fs::write(&image_path, [1_u8, 2, 3]).expect("fixture write");
-        let prompt = format!("describe @{} please", image_path.display());
-
-        let blocks = super::prompt_to_content_blocks(&prompt, Path::new("."))
-            .expect("image ref should parse");
-
-        assert!(matches!(
-            &blocks[0],
-            InputContentBlock::Text { text } if text == "describe "
-        ));
-        assert!(matches!(
-            &blocks[1],
-            InputContentBlock::Image { source }
-                if source.kind == "base64"
-                    && source.media_type == "image/png"
-                    && source.data == "AQID"
-        ));
-        assert!(matches!(
-            &blocks[2],
-            InputContentBlock::Text { text } if text == " please"
-        ));
-    }
-
-    #[test]
-    fn prompt_to_content_blocks_embeds_markdown_image_refs() {
-        let temp = temp_fixture_dir("markdown-image-ref");
-        let image_path = temp.join("sample.webp");
-        std::fs::write(&image_path, [255_u8]).expect("fixture write");
-        let prompt = format!("see ![asset]({}) now", image_path.display());
-
-        let blocks = super::prompt_to_content_blocks(&prompt, Path::new("."))
-            .expect("markdown image ref should parse");
-
-        assert!(matches!(
-            &blocks[1],
-            InputContentBlock::Image { source }
-                if source.media_type == "image/webp" && source.data == "/w=="
-        ));
-    }
-
-    #[test]
-    fn prompt_to_content_blocks_rejects_unsupported_formats() {
-        let temp = temp_fixture_dir("unsupported-image-ref");
-        let image_path = temp.join("sample.bmp");
-        std::fs::write(&image_path, [1_u8]).expect("fixture write");
-        let prompt = format!("describe @{}", image_path.display());
-
-        let error = super::prompt_to_content_blocks(&prompt, Path::new("."))
-            .expect_err("unsupported image ref should fail");
-
-        assert!(error.contains("unsupported image format"));
-    }
-
-    #[test]
-    fn convert_messages_expands_user_text_image_refs() {
-        let temp = temp_fixture_dir("convert-message-image-ref");
-        let image_path = temp.join("sample.gif");
-        std::fs::write(&image_path, [71_u8, 73, 70]).expect("fixture write");
-        let messages = vec![ConversationMessage::user_text(format!(
-            "inspect @{}",
-            image_path.display()
-        ))];
-
-        let converted = super::convert_messages(&messages).expect("messages should convert");
-
-        assert_eq!(converted.len(), 1);
-        assert!(matches!(
-            &converted[0].content[1],
-            InputContentBlock::Image { source }
-                if source.media_type == "image/gif" && source.data == "R0lG"
-        ));
-    }
-
-    fn temp_fixture_dir(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should advance")
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("rusty-claude-cli-{label}-{unique}"));
-        std::fs::create_dir_all(&path).expect("temp dir should exist");
-        path
     }
     #[test]
     fn repl_help_mentions_history_completion_and_multiline() {
         let help = render_repl_help();
         assert!(help.contains("Up/Down"));
         assert!(help.contains("Tab"));
+        assert!(print_help_text_for_test().contains("--no-color"));
         assert!(help.contains("Shift+Enter/Ctrl+J"));
     }
 
     #[test]
     fn tool_rendering_helpers_compact_output() {
-        let start = format_tool_call_start("read_file", r#"{"path":"src/main.rs"}"#);
-        assert!(start.contains("Tool call"));
+        let renderer = TerminalRenderer::with_color(false);
+        let start = format_tool_call_start(&renderer, "read_file", r#"{"path":"src/main.rs"}"#);
+        assert!(start.contains("Tool call:"));
+        assert!(start.contains("read_file"));
         assert!(start.contains("src/main.rs"));
 
-        let done = format_tool_result("read_file", r#"{"contents":"hello"}"#, false);
-        assert!(done.contains("Tool `read_file`"));
+        let done = format_tool_result(&renderer, "read_file", r#"{"contents":"hello"}"#, false);
+        assert!(done.contains("Tool"));
+        assert!(done.contains("`read_file`"));
         assert!(done.contains("contents"));
     }
 }
